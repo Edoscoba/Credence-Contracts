@@ -65,6 +65,21 @@ All Credence smart contracts share a single error type: `ContractError`, defined
 | 212 | `LeverageExceeded` | Resulting leverage exceeds configured maximum |
 | 213 | `UnsupportedToken` | Token transfer resulted in different amount (fee-on-transfer) |
 
+#### Bond variants — common emitters
+
+Below are common contract entry-points and the Bond-related `ContractError` variants they may emit. Use `try_*` client calls in tests to assert these variants.
+
+- `get_identity_state()` — `ContractError::BondNotFound (200)`
+- `withdraw()` / `withdraw_early()` — `ContractError::BondNotFound (200)`, `ContractError::InsufficientBalance (202)`, `ContractError::SlashExceedsBond (203)`, `ContractError::Underflow (701)`
+- `withdraw_early()` — additionally: `ContractError::LockupNotExpired (204)`
+- `request_withdrawal()` — `ContractError::BondNotFound (200)`, `ContractError::NotRollingBond (205)`, `ContractError::WithdrawalAlreadyRequested (206)`
+- `renew_if_rolling()` — `ContractError::BondNotFound (200)`
+- `slash()` / `slash_bond()` — `ContractError::BondNotFound (200)`, `ContractError::Overflow (700)`, `ContractError::SlashExceedsBond (203)`
+- `top_up()` / `extend_duration()` — `ContractError::BondNotFound (200)`, `ContractError::Overflow (700)`
+- `withdraw_bond()` — `ContractError::BondNotFound (200)`, `ContractError::NotBondOwner (101)`, `ContractError::BondNotActive (201)`, `ContractError::ReentrancyDetected (207)`
+
+This mapping is a convenience reference for authors and testers; the authoritative source is `contracts/credence_errors/src/lib.rs`.
+
 ### Attestation (300-399)
 
 | Code | Variant | Description |

@@ -1,7 +1,9 @@
 #![no_std]
 
+use credence_errors::ContractError;
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    panic_with_error,
 };
 
 mod early_exit_penalty;
@@ -63,26 +65,33 @@ impl CredenceBond {
     }
 
     /// Set early exit penalty config (admin only). Penalty in basis points (e.g. 500 = 5%).
+    ///
+    /// Errors:
+    /// - `ContractError::NotInitialized` (1)
+    /// - `ContractError::NotAdmin` (100)
     pub fn set_early_exit_config(e: Env, admin: Address, treasury: Address, penalty_bps: u32) {
         let stored_admin: Address = e
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("not initialized"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
         admin.require_auth();
         if admin != stored_admin {
-            panic!("not admin");
+            panic_with_error!(e, ContractError::NotAdmin);
         }
         early_exit_penalty::set_config(&e, treasury, penalty_bps);
     }
 
     /// Register an authorized attester (only admin can call).
+    ///
+    /// Errors:
+    /// - `ContractError::NotInitialized` (1)
    pub fn register_attester(e: Env, attester: Address) {
     let admin: Address = e
         .storage()
         .instance()
         .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic!("not initialized"));
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
 
     admin.require_auth();
 
@@ -94,12 +103,15 @@ impl CredenceBond {
         .publish((Symbol::new(&e, "attester_registered"),), attester);
 }
     /// Remove an attester's authorization (only admin can call).
+    ///
+    /// Errors:
+    /// - `ContractError::NotInitialized` (1)
    pub fn unregister_attester(e: Env, attester: Address) {
     let admin: Address = e
         .storage()
         .instance()
         .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic!("not initialized"));
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
 
     admin.require_auth();
 
@@ -135,7 +147,7 @@ impl CredenceBond {
         let bond_start = e.ledger().timestamp();
         let _end_timestamp = bond_start
             .checked_add(duration)
-            .expect("bond end timestamp would overflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
 
         let bond = IdentityBond {
             identity: identity.clone(),
@@ -154,14 +166,21 @@ impl CredenceBond {
     }
 
     /// Return current bond state for an identity (simplified: single bond per contract instance).
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
     pub fn get_identity_state(e: Env) -> IdentityBond {
         e.storage()
             .instance()
             .get::<_, IdentityBond>(&DataKey::Bond)
-            .unwrap_or_else(|| panic!("no bond"))
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound))
     }
 
     /// Add an attestation for a subject (only authorized attesters can call).
+    ///
+    /// Errors:
+    /// - `ContractError::UnauthorizedAttester` (102)
+    /// - `ContractError::Overflow` (700)
     pub fn add_attestation(
         e: Env,
         attester: Address,
@@ -178,14 +197,16 @@ impl CredenceBond {
             .unwrap_or(false);
 
         if !is_authorized {
-            panic!("unauthorized attester");
+            panic_with_error!(e, ContractError::UnauthorizedAttester);
         }
 
         // Get and increment attestation counter
         let counter_key = DataKey::AttestationCounter;
         let id: u64 = e.storage().instance().get(&counter_key).unwrap_or(0);
 
-        let next_id = id.checked_add(1).expect("attestation counter overflow");
+        let next_id = id
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
         e.storage().instance().set(&counter_key, &next_id);
 
         // Create attestation
@@ -223,6 +244,11 @@ impl CredenceBond {
     }
 
     /// Revoke an attestation (only the original attester can revoke).
+    ///
+    /// Errors:
+    /// - `ContractError::AttestationNotFound` (301)
+    /// - `ContractError::NotOriginalAttester` (103)
+    /// - `ContractError::AttestationAlreadyRevoked` (302)
     pub fn revoke_attestation(e: Env, attester: Address, attestation_id: u64) {
         attester.require_auth();
 
@@ -232,16 +258,16 @@ impl CredenceBond {
             .storage()
             .instance()
             .get(&key)
-            .unwrap_or_else(|| panic!("attestation not found"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::AttestationNotFound));
 
         // Verify attester is the original attester
         if attestation.attester != attester {
-            panic!("only original attester can revoke");
+            panic_with_error!(e, ContractError::NotOriginalAttester);
         }
 
         // Check if already revoked
         if attestation.revoked {
-            panic!("attestation already revoked");
+            panic_with_error!(e, ContractError::AttestationAlreadyRevoked);
         }
 
         // Mark as revoked
@@ -263,7 +289,7 @@ impl CredenceBond {
         e.storage()
             .instance()
             .get(&DataKey::Attestation(attestation_id))
-            .unwrap_or_else(|| panic!("attestation not found"))
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::AttestationNotFound))
     }
 
     /// Get all attestation IDs for a subject.
@@ -276,34 +302,40 @@ impl CredenceBond {
 
     /// Withdraw from bond. Checks that the bond has sufficient balance after accounting for slashed amount.
     /// Returns the updated bond with reduced bonded_amount.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::SlashExceedsBond` (203)
+    /// - `ContractError::InsufficientBalance` (202)
+    /// - `ContractError::Underflow` (701)
     pub fn withdraw(e: Env, amount: i128) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         // Calculate available balance (bonded - slashed)
         let available = bond
             .bonded_amount
             .checked_sub(bond.slashed_amount)
-            .expect("slashed amount exceeds bonded amount");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::SlashExceedsBond));
 
         // Verify sufficient available balance for withdrawal
         if amount > available {
-            panic!("insufficient balance for withdrawal");
+            panic_with_error!(e, ContractError::InsufficientBalance);
         }
 
         // Perform withdrawal with overflow protection
         bond.bonded_amount = bond
             .bonded_amount
             .checked_sub(amount)
-            .expect("withdrawal caused underflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Underflow));
 
         // Verify invariant: slashed amount should not exceed bonded amount after withdrawal
         if bond.slashed_amount > bond.bonded_amount {
-            panic!("slashed amount exceeds bonded amount");
+            panic_with_error!(e, ContractError::SlashExceedsBond);
         }
 
         let old_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount + amount);
@@ -316,26 +348,33 @@ impl CredenceBond {
 
     /// Withdraw before lock-up end; applies early exit penalty and transfers penalty to treasury.
     /// Net amount to user = amount - penalty. Use when lock-up has not yet ended.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::SlashExceedsBond` (203)
+    /// - `ContractError::InsufficientBalance` (202)
+    /// - `ContractError::LockupNotExpired` (204)
+    /// - `ContractError::Underflow` (701)
     pub fn withdraw_early(e: Env, amount: i128) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         let available = bond
             .bonded_amount
             .checked_sub(bond.slashed_amount)
-            .expect("slashed amount exceeds bonded amount");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::SlashExceedsBond));
         if amount > available {
-            panic!("insufficient balance for withdrawal");
+            panic_with_error!(e, ContractError::InsufficientBalance);
         }
 
         let now = e.ledger().timestamp();
         let end = bond.bond_start.saturating_add(bond.bond_duration);
         if now >= end {
-            panic!("use withdraw for post lock-up");
+            panic_with_error!(e, ContractError::LockupNotExpired);
         }
 
         let (treasury, penalty_bps) = early_exit_penalty::get_config(&e);
@@ -352,9 +391,9 @@ impl CredenceBond {
         bond.bonded_amount = bond
             .bonded_amount
             .checked_sub(amount)
-            .expect("withdrawal caused underflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Underflow));
         if bond.slashed_amount > bond.bonded_amount {
-            panic!("slashed amount exceeds bonded amount");
+            panic_with_error!(e, ContractError::SlashExceedsBond);
         }
         let new_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
         tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
@@ -364,18 +403,23 @@ impl CredenceBond {
     }
 
     /// Request withdrawal (rolling bonds). Withdrawal allowed after notice period.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::NotRollingBond` (205)
+    /// - `ContractError::WithdrawalAlreadyRequested` (206)
     pub fn request_withdrawal(e: Env) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
         if !bond.is_rolling {
-            panic!("not a rolling bond");
+            panic_with_error!(e, ContractError::NotRollingBond);
         }
         if bond.withdrawal_requested_at != 0 {
-            panic!("withdrawal already requested");
+            panic_with_error!(e, ContractError::WithdrawalAlreadyRequested);
         }
         bond.withdrawal_requested_at = e.ledger().timestamp();
         e.storage().instance().set(&key, &bond);
@@ -387,13 +431,16 @@ impl CredenceBond {
     }
 
     /// If bond is rolling and period has ended, renew (new period start = now). Emits renewal event.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
     pub fn renew_if_rolling(e: Env) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
         if !bond.is_rolling {
             return bond;
         }
@@ -418,19 +465,23 @@ impl CredenceBond {
 
     /// Slash a portion of the bond. Increases slashed_amount up to the bonded_amount.
     /// Returns the updated bond with increased slashed_amount.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::Overflow` (700)
     pub fn slash(e: Env, amount: i128) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         // Calculate new slashed amount, checking for overflow
         let new_slashed = bond
             .slashed_amount
             .checked_add(amount)
-            .expect("slashing caused overflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
 
         // Cap slashed amount at bonded amount
         bond.slashed_amount = if new_slashed > bond.bonded_amount {
@@ -444,20 +495,24 @@ impl CredenceBond {
     }
 
     /// Top up the bond with additional amount (checks for overflow)
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::Overflow` (700)
     pub fn top_up(e: Env, amount: i128) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         // Perform top-up with overflow protection
         let old_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
         bond.bonded_amount = bond
             .bonded_amount
             .checked_add(amount)
-            .expect("top-up caused overflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
 
         let new_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
         tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
@@ -467,25 +522,29 @@ impl CredenceBond {
     }
 
     /// Extend bond duration (checks for u64 overflow on timestamps)
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::Overflow` (700)
     pub fn extend_duration(e: Env, additional_duration: u64) -> IdentityBond {
         let key = DataKey::Bond;
         let mut bond = e
             .storage()
             .instance()
             .get::<_, IdentityBond>(&key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         // Perform duration extension with overflow protection
         bond.bond_duration = bond
             .bond_duration
             .checked_add(additional_duration)
-            .expect("duration extension caused overflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
 
         // Also verify the end timestamp wouldn't overflow
         let _end_timestamp = bond
             .bond_start
             .checked_add(bond.bond_duration)
-            .expect("bond end timestamp would overflow");
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::Overflow));
 
         e.storage().instance().set(&key, &bond);
         bond
@@ -500,6 +559,12 @@ impl CredenceBond {
 
     /// Withdraw the full bonded amount back to the identity.
     /// Uses a reentrancy guard to prevent re-entrance during external calls.
+    ///
+    /// Errors:
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::NotBondOwner` (101)
+    /// - `ContractError::BondNotActive` (201)
+    /// - `ContractError::ReentrancyDetected` (207)
     pub fn withdraw_bond(e: Env, identity: Address) -> i128 {
         identity.require_auth();
         Self::acquire_lock(&e);
@@ -509,15 +574,15 @@ impl CredenceBond {
             .storage()
             .instance()
             .get(&bond_key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         if bond.identity != identity {
             Self::release_lock(&e);
-            panic!("not bond owner");
+            panic_with_error!(e, ContractError::NotBondOwner);
         }
         if !bond.active {
             Self::release_lock(&e);
-            panic!("bond not active");
+            panic_with_error!(e, ContractError::BondNotActive);
         }
 
         let withdraw_amount = bond.bonded_amount - bond.slashed_amount;
@@ -551,6 +616,13 @@ impl CredenceBond {
 
     /// Slash a portion of a bond. Only callable by admin.
     /// Uses a reentrancy guard to prevent re-entrance during external calls.
+    ///
+    /// Errors:
+    /// - `ContractError::NotInitialized` (1)
+    /// - `ContractError::NotAdmin` (100)
+    /// - `ContractError::BondNotFound` (200)
+    /// - `ContractError::BondNotActive` (201)
+    /// - `ContractError::SlashExceedsBond` (203)
     pub fn slash_bond(e: Env, admin: Address, slash_amount: i128) -> i128 {
         admin.require_auth();
         Self::acquire_lock(&e);
@@ -559,10 +631,10 @@ impl CredenceBond {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("no admin"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
         if stored_admin != admin {
             Self::release_lock(&e);
-            panic!("not admin");
+            panic_with_error!(e, ContractError::NotAdmin);
         }
 
         let bond_key = DataKey::Bond;
@@ -570,17 +642,17 @@ impl CredenceBond {
             .storage()
             .instance()
             .get(&bond_key)
-            .unwrap_or_else(|| panic!("no bond"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::BondNotFound));
 
         if !bond.active {
             Self::release_lock(&e);
-            panic!("bond not active");
+            panic_with_error!(e, ContractError::BondNotActive);
         }
 
         let new_slashed = bond.slashed_amount + slash_amount;
         if new_slashed > bond.bonded_amount {
             Self::release_lock(&e);
-            panic!("slash exceeds bond");
+            panic_with_error!(e, ContractError::SlashExceedsBond);
         }
 
         // State update BEFORE external interaction
@@ -611,6 +683,10 @@ impl CredenceBond {
 
     /// Collect accumulated protocol fees. Only callable by admin.
     /// Uses a reentrancy guard to prevent re-entrance during external calls.
+    ///
+    /// Errors:
+    /// - `ContractError::NotInitialized` (1)
+    /// - `ContractError::NotAdmin` (100)
     pub fn collect_fees(e: Env, admin: Address) -> i128 {
         admin.require_auth();
         Self::acquire_lock(&e);
@@ -619,10 +695,10 @@ impl CredenceBond {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("no admin"));
+            .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
         if stored_admin != admin {
             Self::release_lock(&e);
-            panic!("not admin");
+            panic_with_error!(e, ContractError::NotAdmin);
         }
 
         let fee_key = Symbol::new(&e, "fees");
@@ -661,7 +737,7 @@ impl CredenceBond {
         let key = Symbol::new(e, "locked");
         let locked: bool = e.storage().instance().get(&key).unwrap_or(false);
         if locked {
-            panic!("reentrancy detected");
+            panic_with_error!(e, ContractError::ReentrancyDetected);
         }
         e.storage().instance().set(&key, &true);
     }
