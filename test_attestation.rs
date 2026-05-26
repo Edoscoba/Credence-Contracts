@@ -8,7 +8,9 @@ fn setup() -> (Env, CredenceBondClient<'static>, Address) {
     let contract_id = e.register(CredenceBond, ());
     let client = CredenceBondClient::new(&e, &contract_id);
     let admin = Address::generate(&e);
-    client.initialize(&admin);
+    let token_admin = Address::generate(&e);
+    let token_id = e.register_stellar_asset_contract(token_admin);
+    client.initialize(&admin, &token_id);
     (e, client, admin)
 }
 

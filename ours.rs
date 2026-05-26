@@ -9,7 +9,9 @@ mod weighted_attestation;
 
 pub mod types;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 /// Identity tier based on bonded amount (Bronze < Silver < Gold < Platinum).
 #[contracttype]
@@ -46,6 +48,8 @@ pub enum DataKey {
     Admin,
     /// Emergency pause flag. When true, mutating entrypoints are blocked.
     Paused,
+    /// Token contract used for real bond custody.
+    Token,
     Bond,
     Attester(Address),
     Attestation(u64),
@@ -64,10 +68,11 @@ pub struct CredenceBond;
 
 #[contractimpl]
 impl CredenceBond {
-    /// Initialize the contract (admin).
-    pub fn initialize(e: Env, admin: Address) {
+    /// Initialize the contract (admin) with the token used for custody.
+    pub fn initialize(e: Env, admin: Address, token: Address) {
         admin.require_auth();
         e.storage().instance().set(&DataKey::Admin, &admin);
+        e.storage().instance().set(&DataKey::Token, &token);
         e.storage().instance().set(&DataKey::Paused, &false);
     }
 
@@ -139,8 +144,9 @@ impl CredenceBond {
             .unwrap_or(false)
     }
 
-    /// Create or top-up a bond for an identity. Blocked while paused.
-    /// In a full implementation this would transfer USDC from the caller and store the bond.
+    /// Create a bond and escrow the amount into this contract. Blocked while paused.
+    /// Custody invariant: on success, the contract holds the newly bonded tokens.
+    /// The caller must approve this contract to pull `amount` of the configured token.
     pub fn create_bond(
         e: Env,
         identity: Address,
@@ -150,6 +156,8 @@ impl CredenceBond {
         notice_period_duration: u64,
     ) -> IdentityBond {
         Self::require_not_paused(&e);
+        identity.require_auth();
+        Self::require_positive_amount(amount, "bond amount must be positive");
         let bond_start = e.ledger().timestamp();
 
         // Verify the end timestamp wouldn't overflow
@@ -172,6 +180,7 @@ impl CredenceBond {
         e.storage().instance().set(&key, &bond);
         let tier = tiered_bond::get_tier_for_amount(amount);
         tiered_bond::emit_tier_change_if_needed(&e, &identity, BondTier::Bronze, tier);
+        Self::pull_tokens(&e, &identity, amount);
         bond
     }
 
@@ -396,7 +405,8 @@ impl CredenceBond {
 
     /// Withdraw from bond. Blocked while paused.
     /// Checks that the bond has sufficient balance after accounting for slashed amount.
-    /// Returns the updated bond with reduced bonded_amount.
+    /// Custody invariant: the contract transfers the withdrawn amount to the bond identity
+    /// after persisting the reduced bond state.
     pub fn withdraw(e: Env, amount: i128) -> IdentityBond {
         Self::require_not_paused(&e);
         let key = DataKey::Bond;
@@ -405,6 +415,8 @@ impl CredenceBond {
             .instance()
             .get::<_, IdentityBond>(&key)
             .unwrap_or_else(|| panic!("no bond"));
+        bond.identity.require_auth();
+        Self::require_positive_amount(amount, "withdraw amount must be positive");
 
         // Calculate available balance (bonded - slashed)
         let available = bond
@@ -429,11 +441,14 @@ impl CredenceBond {
         }
 
         e.storage().instance().set(&key, &bond);
+        Self::push_tokens(&e, &bond.identity, amount);
         bond
     }
 
     /// Withdraw before lock-up end; blocked while paused.
     /// Applies early exit penalty and transfers penalty to treasury.
+    /// Custody invariant: after persisting the reduced bond state, the contract transfers
+    /// `amount - penalty` to the bond identity and `penalty` to the configured treasury.
     /// Net amount to user = amount - penalty. Use when lock-up has not yet ended.
     pub fn withdraw_early(e: Env, amount: i128) -> IdentityBond {
         Self::require_not_paused(&e);
@@ -443,6 +458,8 @@ impl CredenceBond {
             .instance()
             .get::<_, IdentityBond>(&key)
             .unwrap_or_else(|| panic!("no bond"));
+        bond.identity.require_auth();
+        Self::require_positive_amount(amount, "withdraw amount must be positive");
 
         let available = bond
             .bonded_amount
@@ -481,6 +498,11 @@ impl CredenceBond {
         tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
 
         e.storage().instance().set(&key, &bond);
+        let net_amount = amount
+            .checked_sub(penalty)
+            .expect("penalty exceeds withdrawal amount");
+        Self::push_tokens(&e, &bond.identity, net_amount);
+        Self::push_tokens(&e, &treasury, penalty);
         bond
     }
 
@@ -562,7 +584,8 @@ impl CredenceBond {
         Self::get_identity_state(e)
     }
 
-    /// Top up the bond with additional amount (checks for overflow). Blocked while paused.
+    /// Top up the bond with additional escrowed custody. Blocked while paused.
+    /// Custody invariant: bonded amount increases only after the additional tokens are pulled in.
     pub fn top_up(e: Env, amount: i128) -> IdentityBond {
         Self::require_not_paused(&e);
         let key = DataKey::Bond;
@@ -571,6 +594,8 @@ impl CredenceBond {
             .instance()
             .get::<_, IdentityBond>(&key)
             .unwrap_or_else(|| panic!("no bond"));
+        bond.identity.require_auth();
+        Self::require_positive_amount(amount, "top-up amount must be positive");
 
         // Perform top-up with overflow protection
         bond.bonded_amount = bond
@@ -579,6 +604,7 @@ impl CredenceBond {
             .expect("top-up caused overflow");
 
         e.storage().instance().set(&key, &bond);
+        Self::pull_tokens(&e, &bond.identity, amount);
         bond
     }
 
@@ -829,6 +855,46 @@ impl CredenceBond {
         }
         admin.require_auth();
     }
+
+    fn token_address(e: &Env) -> Address {
+        e.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic!("token not configured"))
+    }
+
+    fn token_client<'a>(e: &'a Env) -> token::TokenClient<'a> {
+        let token = Self::token_address(e);
+        token::TokenClient::new(e, &token)
+    }
+
+    fn require_positive_amount(amount: i128, message: &str) {
+        if amount <= 0 {
+            panic!("{}", message);
+        }
+    }
+
+    fn pull_tokens(e: &Env, from: &Address, amount: i128) {
+        if amount == 0 {
+            return;
+        }
+        let contract_addr = e.current_contract_address();
+        let token_client = Self::token_client(e);
+        let allowance = token_client.allowance(from, &contract_addr);
+        if allowance < amount {
+            panic!("insufficient token allowance");
+        }
+        token_client.transfer_from(&contract_addr, from, &contract_addr, &amount);
+    }
+
+    fn push_tokens(e: &Env, to: &Address, amount: i128) {
+        if amount == 0 {
+            return;
+        }
+        let token_client = Self::token_client(e);
+        let contract_addr = e.current_contract_address();
+        token_client.transfer(&contract_addr, to, &amount);
+    }
 }
 
 #[cfg(test)]
@@ -853,4 +919,11 @@ mod test_pausable;
 mod test_slash_bond;
 
 #[cfg(test)]
+mod test_token_custody;
+
+#[cfg(test)]
 mod security;
+    /// Return the token configured for bond custody.
+    pub fn get_token(e: Env) -> Address {
+        Self::token_address(&e)
+    }

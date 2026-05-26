@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events};
-use soroban_sdk::{Address, Env, IntoVal, Symbol, TryIntoVal, Val};
+use soroban_sdk::{token, Address, Env, IntoVal, Symbol, TryIntoVal, Val};
 
 const AMOUNT: i128 = 1_000;
 const DURATION: u64 = 1_000;
@@ -12,7 +12,13 @@ fn setup() -> (Env, CredenceBondClient<'static>, Address, Address) {
     let client = CredenceBondClient::new(&e, &contract_id);
     let admin = Address::generate(&e);
     let identity = Address::generate(&e);
-    client.initialize(&admin);
+    let token_admin = Address::generate(&e);
+    let token_id = e.register_stellar_asset_contract(token_admin);
+    client.initialize(&admin, &token_id);
+    let stellar = token::StellarAssetClient::new(&e, &token_id);
+    let token = token::TokenClient::new(&e, &token_id);
+    stellar.mint(&identity, &AMOUNT);
+    token.approve(&identity, &client.address, &AMOUNT, &1_000_u32);
     client.create_bond(&identity, &AMOUNT, &DURATION, &false, &0_u64);
     (e, client, admin, identity)
 }

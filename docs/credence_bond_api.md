@@ -44,9 +44,13 @@ An enum representing the user's reputation level:
 
 ## Initialization & Admin
 
-### `initialize(e: Env, admin: Address)`
+### `initialize(e: Env, admin: Address, token: Address)`
 
-Sets the primary administrator for the contract. This can only be called once.
+Sets the primary administrator and the custody token for the contract. This can only be called once.
+
+### `get_token(e: Env) -> Address`
+
+Returns the configured custody token address.
 
 ### `set_token(e: Env, admin: Address, token: Address)`
 
@@ -66,13 +70,16 @@ Whitelists an address to allow it to submit attestations for other identities.
 
 ### `create_bond(...)`
 
-Creates a standard or rolling bond. Transfers tokens from the identity to the contract.
+Creates a standard or rolling bond. Pulls approved custody tokens from the identity into the contract.
 
 * **Params**: `identity`, `amount`, `duration`, `is_rolling`, `notice_period_duration`.
+* **Auth**: `identity.require_auth()`
+* **Invariant**: on success, the contract custody increases by `amount`.
 
 ### `top_up(e: Env, amount: i128)`
 
 Increases the stake of an existing bond to reach a higher `BondTier`.
+Pulls additional approved custody tokens from the bonded identity into the contract.
 
 ### `request_withdrawal(e: Env)`
 
@@ -88,7 +95,7 @@ Withdraws funds after the lock-up or notice period has elapsed.
 
 Withdraws funds before the duration is over.
 
-* **Penalty**: Applies a penalty defined in the `early_exit_penalty` module, which is sent to the treasury.
+* **Penalty**: Applies a penalty defined in the `early_exit_penalty` module, which is transferred to the treasury while the net amount is transferred to the bonded identity.
 
 ---
 
@@ -147,3 +154,4 @@ If the quorum is reached (e.g., 51% approval), the proposer executes this functi
 * **Reentrancy Guard**: Functions involving external callbacks use `with_reentrancy_guard` to prevent recursive attacks.
 * **CEI Pattern**: All state updates (Checks-Effects) happen before external token Interactions.
 * **Replay Prevention**: Nonces are consumed for every sensitive attestation action.
+* **Custody**: Real token escrow for `create_bond`, `top_up`, `withdraw`, and `withdraw_early` is documented in [bond-token-custody.md](bond-token-custody.md).

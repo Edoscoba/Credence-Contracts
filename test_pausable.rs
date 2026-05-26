@@ -1,29 +1,41 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{token, Address, Env};
 
 const AMOUNT: i128 = 1_000;
 const DURATION: u64 = 1_000;
 const NOTICE: u64 = 100;
 
-fn setup() -> (Env, CredenceBondClient<'static>, Address, Address) {
+fn setup() -> (Env, CredenceBondClient<'static>, Address, Address, Address) {
     let e = Env::default();
     e.mock_all_auths();
     let contract_id = e.register(CredenceBond, ());
     let client = CredenceBondClient::new(&e, &contract_id);
     let admin = Address::generate(&e);
     let identity = Address::generate(&e);
-    client.initialize(&admin);
-    (e, client, admin, identity)
+    let token_admin = Address::generate(&e);
+    let token_id = e.register_stellar_asset_contract(token_admin);
+    client.initialize(&admin, &token_id);
+    (e, client, admin, identity, token_id)
 }
 
-fn create_active_bond(client: &CredenceBondClient<'static>, identity: &Address, rolling: bool) {
+fn create_active_bond(
+    e: &Env,
+    client: &CredenceBondClient<'static>,
+    identity: &Address,
+    token_id: &Address,
+    rolling: bool,
+) {
+    let token_admin = token::StellarAssetClient::new(e, token_id);
+    let token_client = token::TokenClient::new(e, token_id);
+    token_admin.mint(identity, &AMOUNT);
+    token_client.approve(identity, &client.address, &AMOUNT, &1_000_u32);
     client.create_bond(identity, &AMOUNT, &DURATION, &rolling, &NOTICE);
 }
 
 #[test]
 fn pause_and_unpause_are_admin_gated() {
-    let (e, client, admin, _) = setup();
+    let (e, client, admin, _, _) = setup();
     let non_admin = Address::generate(&e);
 
     assert!(!client.is_paused());
@@ -39,10 +51,10 @@ fn pause_and_unpause_are_admin_gated() {
 
 #[test]
 fn paused_blocks_required_bond_mutators() {
-    let (e, client, admin, identity) = setup();
+    let (e, client, admin, identity, token_id) = setup();
     let treasury = Address::generate(&e);
 
-    create_active_bond(&client, &identity, true);
+    create_active_bond(&e, &client, &identity, &token_id, true);
     client.set_early_exit_config(&admin, &treasury, &500_u32);
     client.deposit_fees(&25_i128);
     client.pause(&admin);
@@ -62,10 +74,10 @@ fn paused_blocks_required_bond_mutators() {
 
 #[test]
 fn paused_blocks_other_mutating_entrypoints() {
-    let (e, client, admin, identity) = setup();
+    let (e, client, admin, identity, token_id) = setup();
     let attester = Address::generate(&e);
     let treasury = Address::generate(&e);
-    create_active_bond(&client, &identity, false);
+    create_active_bond(&e, &client, &identity, &token_id, false);
     client.pause(&admin);
 
     assert!(client
@@ -86,8 +98,8 @@ fn paused_blocks_other_mutating_entrypoints() {
 
 #[test]
 fn views_remain_callable_while_paused() {
-    let (_, client, admin, identity) = setup();
-    create_active_bond(&client, &identity, false);
+    let (e, client, admin, identity, token_id) = setup();
+    create_active_bond(&e, &client, &identity, &token_id, false);
     client.pause(&admin);
 
     assert!(client.is_paused());
@@ -99,8 +111,8 @@ fn views_remain_callable_while_paused() {
 
 #[test]
 fn unpause_restores_mutating_paths_after_active_lockup_pause() {
-    let (e, client, admin, identity) = setup();
-    create_active_bond(&client, &identity, true);
+    let (e, client, admin, identity, token_id) = setup();
+    create_active_bond(&e, &client, &identity, &token_id, true);
 
     e.ledger().with_mut(|li| {
         li.timestamp = 10;
