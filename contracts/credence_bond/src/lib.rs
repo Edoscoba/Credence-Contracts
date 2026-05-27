@@ -134,6 +134,9 @@ pub fn create_bond(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use credence_errors::ContractError;
